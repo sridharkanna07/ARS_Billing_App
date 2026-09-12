@@ -1195,6 +1195,110 @@ function mergeRemoteSale(remote){
 
 /* Writes a sale up to Firebase. Safe to call when offline or unconfigured —
    the local copy is already saved, and the SDK queues writes made offline. */
+/* ================= AUTOMATIC BACKUP INTO THE GOOGLE SHEET =================
+   Writes every completed bill straight into the "Sales" tab of the same
+   Google Sheet used for prices, so the shop has a running backup without
+   anyone downloading or uploading anything.
+
+   A browser cannot write to a Google Sheet on its own — Google requires a
+   script running under the sheet owner's account. So this posts each bill to
+   a small Apps Script Web App (set up once, code shown in Admin -> Backup).
+   Rows are keyed by bill id, so a re-send updates that row instead of adding
+   a duplicate, and a cancelled bill overwrites its own row.
+
+   Bills are always saved on the device first. Anything that fails to upload
+   (no signal, script not set up yet) is kept marked and retried on the next
+   sync, so nothing is ever lost. */
+
+var SHEET_BACKUP = loadJSON('ars_sheet_backup', { webAppUrl: '' });
+
+/* Paste-ready Apps Script for the one-time setup (displayed in Admin -> Backup).
+   Upserts by Bill ID into a "Sales" tab, creating it with headers if missing. */
+var SHEET_BACKUP_SCRIPT = [
+'function doPost(e) {',
+'  try {',
+'    var b = JSON.parse(e.postData.contents);',
+'    var ss = SpreadsheetApp.getActiveSpreadsheet();',
+'    var sh = ss.getSheetByName("Sales");',
+'    var head = ["Bill ID","Bill No","Date","Seller","Status","Items",',
+'                "Subtotal","Discount %","Discount","Total","Paid","Payment","Phone","Item Details"];',
+'    if (!sh) { sh = ss.insertSheet("Sales"); sh.appendRow(head); }',
+'    var items = b.items || [];',
+'    var detail = items.map(function(i){',
+'      return i.en + " x" + i.qty + " @" + i.price + " = " + (i.qty * i.price);',
+'    }).join("; ");',
+'    var qty = items.reduce(function(a,i){ return a + (i.qty || 0); }, 0);',
+'    var row = [b.id, b.billNo, b.time, b.sellerName, b.status, qty,',
+'               b.subtotal, b.discountPercent, b.discount, b.total,',
+'               b.paidAmount, b.paymentMethod, b.buyerPhone, detail];',
+'    var data = sh.getDataRange().getValues();',
+'    var at = -1;',
+'    for (var i = 1; i < data.length; i++) {',
+'      if (String(data[i][0]) === String(b.id)) { at = i + 1; break; }',
+'    }',
+'    if (at > 0) sh.getRange(at, 1, 1, row.length).setValues([row]);',
+'    else sh.appendRow(row);',
+'    return ContentService.createTextOutput(JSON.stringify({status:"ok"}))',
+'      .setMimeType(ContentService.MimeType.JSON);',
+'  } catch (err) {',
+'    return ContentService.createTextOutput(JSON.stringify({status:"error", message:String(err)}))',
+'      .setMimeType(ContentService.MimeType.JSON);',
+'  }',
+'}'
+].join('\n');
+
+function saveSheetBackupUrl(url){
+  SHEET_BACKUP.webAppUrl = (url || '').trim();
+  saveJSON('ars_sheet_backup', SHEET_BACKUP);
+}
+
+function pendingBackupCount(){
+  return (loadJSON('ars_sales', []) || []).filter(function(s){ return !s._sheetSynced; }).length;
+}
+
+/* Sent as text/plain on purpose: an application/json body would trigger a CORS
+   preflight, which Apps Script Web Apps cannot answer. doPost still reads the
+   raw body as JSON either way. */
+async function pushSaleToSheet(sale){
+  if(!SHEET_BACKUP.webAppUrl || !sale || !sale.id) return false;
+  try{
+    var res = await fetch(SHEET_BACKUP.webAppUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify(sale)
+    });
+    var data = await res.json().catch(function(){ return null; });
+    if(data && data.status === 'ok'){
+      // Re-find by id: other code reloads SALES from storage, which would
+      // otherwise detach the object being flagged here and lose the flag.
+      var list = loadJSON('ars_sales', []) || [];
+      var cur = list.find(function(s){ return s.id === sale.id; });
+      if(cur){ cur._sheetSynced = true; saveJSON('ars_sales', list); SALES = list; }
+      return true;
+    }
+  }catch(e){ /* offline or unreachable — retried later */ }
+  return false;
+}
+
+/* Uploads anything still outstanding, oldest first. */
+async function retryPendingSheetBackups(){
+  if(!SHEET_BACKUP.webAppUrl) return;
+  var list = loadJSON('ars_sales', []) || [];
+  var pending = list.filter(function(s){ return !s._sheetSynced; });
+  for(var i = 0; i < pending.length; i++){
+    await pushSaleToSheet(pending[i]);
+  }
+  var el = document.getElementById('sheetBackupStatus');
+  if(el) el.textContent = backupStatusText();
+}
+
+function backupStatusText(){
+  if(!SHEET_BACKUP.webAppUrl) return 'Not set up — bills are saved on this device only.';
+  var n = pendingBackupCount();
+  return n === 0 ? '\u2713 All bills backed up to the Google Sheet.'
+                 : n + ' bill(s) waiting to upload — they will go up automatically.';
+}
+
 function pushSaleToFirebase(sale){
   if(!_fbDb || !sale || !sale.id) return;
   try{ _fbDb.ref('sales/' + sale.id).set(sale); }catch(e){}
@@ -1504,6 +1608,9 @@ async function syncFromGoogleDrive(manual){
     const accountsTable = await fetchOptionalTab(parsed.id, 'Accounts');
     if(accountsTable) applyAccountsTable(accountsTable);
 
+    // Upload any bills that couldn't be backed up earlier (made offline, etc.)
+    await retryPendingSheetBackups();
+
     DRIVE_SYNC.lastSync = Date.now();
     DRIVE_SYNC.lastStatus = 'ok';
     saveJSON('ars_drive_sync', DRIVE_SYNC);
@@ -1680,6 +1787,38 @@ async function buildPricingWorkbookBlob(){
   const acctWs = XLSX.utils.aoa_to_sheet(acctAoa);
   acctWs['!cols'] = [{wch:14},{wch:10},{wch:10},{wch:20}];
   XLSX.utils.book_append_sheet(wb, acctWs, 'Accounts');
+
+  // ---- Sales tab: every bill from every seller on this device ----
+  const allSales = loadJSON('ars_sales', []) || [];
+  const salesAoa = [['Bill No','Date','Time','Seller','Status','Items','Subtotal (₹)',
+                     'Discount %','Discount (₹)','Total (₹)','Paid (₹)','Payment','Customer Phone','Item Details']];
+  // newest first, same order the admin sees on screen
+  [...allSales].reverse().forEach(s => {
+    const d = s.time ? new Date(s.time) : null;
+    const detail = (s.items || [])
+      .map(it => `${it.en} x${it.qty} @${it.price} = ${it.qty * it.price}`)
+      .join('; ');
+    salesAoa.push([
+      s.billNo || '',
+      d ? d.toLocaleDateString('en-IN') : '',
+      d ? d.toLocaleTimeString('en-IN', {hour:'2-digit', minute:'2-digit'}) : '',
+      s.sellerName || s.sellerId || '',
+      (s.status || 'confirmed'),
+      (s.items || []).reduce((a, it) => a + (it.qty || 0), 0),
+      s.subtotal || 0,
+      s.discountPercent || 0,
+      s.discount || 0,
+      s.total || 0,
+      s.paidAmount || '',
+      s.paymentMethod === 'upi' ? 'UPI' : 'Cash',
+      s.buyerPhone || '',
+      detail
+    ]);
+  });
+  const salesWs = XLSX.utils.aoa_to_sheet(salesAoa);
+  salesWs['!cols'] = [{wch:9},{wch:12},{wch:9},{wch:16},{wch:11},{wch:7},{wch:12},
+                      {wch:10},{wch:12},{wch:12},{wch:11},{wch:9},{wch:15},{wch:60}];
+  XLSX.utils.book_append_sheet(wb, salesWs, 'Sales');
 
   const wbout = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
   return new Blob([wbout], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
@@ -2279,6 +2418,7 @@ function completeSale(paymentMethod){
   saveJSON('ars_sales', SALES);
   lastCompletedSale = newSale;
   pushSaleToFirebase(newSale);   // live-sync this bill to every other device
+  pushSaleToSheet(newSale);      // back up this bill into the Google Sheet
   
   // Auto-send bill text to admin (controlled by admin panel toggle, hidden from sellers)
   sendBillToAdminSMS(newSale);
@@ -2867,16 +3007,67 @@ function ensureHtml2Canvas(){
 }
 
 let _qrLibLoadPromise = null;
+/* Several mirrors of the same QR library. One CDN being down, blocked by the
+   browser's shields, or unreachable on the shop's connection should not stop
+   UPI payments. */
+var QR_LIB_SOURCES = [
+  'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js',
+  'https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js',
+  'https://unpkg.com/qrcodejs@1.0.0/qrcode.min.js'
+];
+
+/* Loads the QR library and keeps a copy on the device, so after it has
+   worked once the QR keeps working with no internet at all. Order tried:
+     1. the saved copy (instant, offline)
+     2. each mirror in turn, saving whichever one succeeds
+     3. a plain <script> tag as a last resort, for the case where fetch is
+        blocked but script loading is allowed */
 function ensureQRCodeLib(){
   if(window.QRCode) return Promise.resolve();
   if(_qrLibLoadPromise) return _qrLibLoadPromise;
-  _qrLibLoadPromise = new Promise((resolve, reject) => {
-    const s = document.createElement('script');
-    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';
-    s.onload = () => resolve();
-    s.onerror = () => { _qrLibLoadPromise = null; reject(new Error('Could not load the QR code engine. Check your internet connection and try again.')); };
-    document.head.appendChild(s);
-  });
+
+  _qrLibLoadPromise = (async function(){
+    function runSource(src){
+      try{
+        (0, eval)(src);
+        return !!window.QRCode;
+      }catch(e){ return false; }
+    }
+
+    // 1. saved copy from a previous successful load
+    try{
+      var cached = localStorage.getItem('ars_qr_lib');
+      if(cached && runSource(cached)) return;
+    }catch(e){}
+
+    // 2. try each mirror, remembering the first that works
+    for(var i = 0; i < QR_LIB_SOURCES.length; i++){
+      try{
+        var res = await fetch(QR_LIB_SOURCES[i], { cache: 'force-cache' });
+        if(!res.ok) continue;
+        var src = await res.text();
+        if(runSource(src)){
+          try{ localStorage.setItem('ars_qr_lib', src); }catch(e){}   // may exceed quota; harmless
+          return;
+        }
+      }catch(e){ /* try the next mirror */ }
+    }
+
+    // 3. last resort: ordinary script tag (cannot be cached, but may work
+    //    where fetch is blocked by an extension or CORS)
+    var ok = await new Promise(function(resolve){
+      var s = document.createElement('script');
+      s.src = QR_LIB_SOURCES[0];
+      s.onload = function(){ resolve(!!window.QRCode); };
+      s.onerror = function(){ resolve(false); };
+      document.head.appendChild(s);
+    });
+    if(ok) return;
+
+    _qrLibLoadPromise = null;   // allow a retry on the next attempt
+    throw new Error('Could not load the QR code engine.\n\nConnect to the internet once and open this screen again — the QR will then keep working offline.\n\nMeanwhile you can still take the payment and tap "Payment Received".');
+  })();
+
   return _qrLibLoadPromise;
 }
 
@@ -3298,7 +3489,10 @@ function setSaleStatus(saleId, status){
   if(!s) return;
   s.status = status;
   saveJSON('ars_sales', SALES);
+  s._sheetSynced = false;  // changed, so it must be re-uploaded
+  saveJSON('ars_sales', SALES);
   pushSaleToFirebase(s);   // live-sync the status change to every other device
+  pushSaleToSheet(s);      // update this bill's row in the Google Sheet
   renderAdmin();
 }
 async function cancelOrder(saleId){
@@ -4043,7 +4237,10 @@ function renderAdmin(){
           anywhere) and save. Every seller's app — and yours — automatically pulls the latest data once
           each time the app is opened. Turn on "Auto-sync every 5 minutes" below only if you also want it
           to keep re-checking while the app stays open in the background.<br><br>
-          The sheet has 3 tabs, each syncing automatically — edit any of them:<br>
+          The downloaded workbook also carries a <b>Sales</b> tab holding every bill on this device
+          (bill no, date, seller, items, totals, payment) — re-upload it to Drive to keep a shared
+          backup of the history.<br><br>
+          The sheet has 3 tabs that sync back <i>into</i> the app — edit any of them:<br>
           • <b>Price List</b> — item prices &amp; units<br>
           • <b>UPI</b> — UPI ID / name / enabled (tick the checkbox)<br>
           • <b>Accounts</b> — add sellers, change PINs, control who can log in<br>
@@ -4060,7 +4257,7 @@ function renderAdmin(){
         <div class="icon-square-col">
           <button class="icon-square-btn" onclick="saveDriveSettingsFromUI()" style="background:#1a4d8f; color:#fff; width:100%; margin-bottom:8px;" title="Save Link">💾<span>Save Sheet Link</span></button>
           <div class="icon-square-row">
-            <button class="icon-square-btn" onclick="downloadPricingDataFile()" style="background:#eadcc0; color:var(--ink);" title="Download Google Sheet Template">&#11015;<span>Download Sheet Template</span></button>
+            <button class="icon-square-btn" onclick="downloadPricingDataFile()" style="background:#eadcc0; color:var(--ink);" title="Download workbook: Price List, UPI, Accounts and all Sales history">&#11015;<span>Download Excel (incl. Sales)</span></button>
             <button class="icon-square-btn" onclick="syncFromGoogleDrive(true)" style="background:#3b6fa8; color:#fff;" title="Sync Now">🔄<span>Sync Now</span></button>
           </div>
         </div>
@@ -4068,6 +4265,25 @@ function renderAdmin(){
           ${DRIVE_SYNC.lastSync ? 'Last synced: ' + new Date(DRIVE_SYNC.lastSync).toLocaleString('en-IN') : 'Not synced yet'}
           ${DRIVE_SYNC.lastStatus === 'error' ? ' — <span style="color:var(--danger); font-weight:700;">last attempt failed</span>' : ''}
         </div>
+      </div>
+      <div class="backup-card" style="background:#eef7ee; border-color:#2e7d32;">
+        <div class="section-title" style="margin-top:0; color:#2e7d32;">&#128190; Auto Backup to Google Sheet</div>
+        <div class="backup-note" style="background:#f4fbf4; border-color:#2e7d32; color:#1e5c26; margin-bottom:12px;">
+          Saves every bill into the <b>Sales</b> tab of your Google Sheet automatically, as soon as it is
+          completed. Bills made with no signal upload by themselves once the connection returns.<br><br>
+          <b>One-time setup</b> (about 2 minutes, needs your own Google account):<br>
+          1. Open your Google Sheet &rarr; menu <b>Extensions &rarr; Apps Script</b><br>
+          2. Delete whatever is in the editor and paste the code below<br>
+          3. <b>Deploy &rarr; New deployment</b> &rarr; gear icon &rarr; type <b>Web app</b><br>
+          4. Execute as <b>Me</b>, Who has access <b>Anyone</b> &rarr; <b>Deploy</b> &rarr; approve the prompt<br>
+          5. Copy the <b>Web app URL</b> (ends in <b>/exec</b>) and paste it below
+        </div>
+        <textarea readonly onclick="this.select()" style="width:100%; height:96px; font-family:monospace; font-size:10px; padding:8px; border-radius:6px; border:1px solid #2e7d32; margin-bottom:10px;">${SHEET_BACKUP_SCRIPT}</textarea>
+        <label class="field-label">Apps Script Web App URL</label>
+        <input type="text" id="sheetBackupUrlInput" placeholder="https://script.google.com/macros/s/.../exec" value="${SHEET_BACKUP.webAppUrl || ''}"
+          style="width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); margin-bottom:10px; font-size:13px;">
+        <button onclick="saveSheetBackupFromUI()" style="width:100%; padding:11px; background:#2e7d32; color:#fff; border:none; border-radius:8px; font-weight:700; cursor:pointer;">&#128190; Save &amp; Back Up Now</button>
+        <div class="empty-admin" style="text-align:left; padding:8px 4px 0; font-size:11.5px;" id="sheetBackupStatus">${backupStatusText()}</div>
       </div>
       <div class="backup-card" style="background:#fff3e0; border-color:#e8710a;">
         <div class="section-title" style="margin-top:0; color:#b45309;">&#128293; Live Bill Sync (Firebase)</div>
@@ -4096,6 +4312,18 @@ function renderAdmin(){
       </div>
       <div class="empty-admin" style="text-align:left; padding:0 4px;" id="backupStatus"></div>`;
   }
+}
+
+async function saveSheetBackupFromUI(){
+  var url = document.getElementById('sheetBackupUrlInput').value.trim();
+  if(url && !/\/exec\s*$/.test(url)){
+    alert('That does not look like a Web app URL.\n\nIt should end in /exec — copy it from Deploy \u2192 Manage deployments.');
+    return;
+  }
+  saveSheetBackupUrl(url);
+  showAdminNotification('\u2713 Backup link saved');
+  await retryPendingSheetBackups();
+  renderAdmin();
 }
 
 function saveFirebaseConfigFromUI(){
