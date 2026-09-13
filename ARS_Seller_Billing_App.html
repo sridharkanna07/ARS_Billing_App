@@ -146,6 +146,28 @@
 
   main{flex:0 0 auto; padding:8px 10px 4px;}
 
+  /* ---------------- CATEGORY FILTER STRIP ---------------- */
+  nav.cats{
+    display:flex; gap:7px; align-items:center;
+    padding:8px 12px;
+    background:var(--paper); border-bottom:1px solid var(--line);
+    /* one row that scrolls sideways rather than wrapping onto many lines */
+    overflow-x:auto; overflow-y:hidden; white-space:nowrap;
+    -webkit-overflow-scrolling:touch;
+    scrollbar-width:none;                 /* Firefox */
+  }
+  nav.cats::-webkit-scrollbar{ display:none; }   /* Chrome/Safari */
+  nav.cats.hidden{ display:none; }
+  .cat-chip{
+    flex:0 0 auto;                        /* never shrink, so they scroll instead */
+    padding:7px 14px; border-radius:999px; cursor:pointer;
+    font-size:12px; font-weight:700; line-height:1.2;
+    background:#fbeed2; color:var(--maroon); border:1px solid #e9c98a;
+    max-width:150px; overflow:hidden; text-overflow:ellipsis;
+  }
+  .cat-chip.active{ background:var(--maroon); color:#fff8e6; border-color:var(--maroon); }
+  .cat-chip:active{ transform:scale(.96); }
+
   /* ---------------- ADD TO HOME SCREEN BANNER ---------------- */
   #a2hsBar{
     position:fixed; left:0; right:0; top:0; z-index:20000;
@@ -1980,6 +2002,9 @@ function setTab(t){
   }
   
   document.getElementById('cartBar').classList.toggle('hidden', t!=='billing1' && t!=='billing2');
+  // the category strip only makes sense while billing
+  const catNavEl = document.getElementById('catNav');
+  if(catNavEl) catNavEl.classList.toggle('hidden', t!=='billing1' && t!=='billing2');
   const btn = document.getElementById('clearShareBtn');
   if(t === 'history'){
     btn.classList.add('hidden');
@@ -1996,9 +2021,27 @@ function handleClearShareClick(btn){
   clearCart();
 }
 
+/* One horizontal row of category chips above the item list. Swipe sideways to
+   reach the rest — 17 categories would otherwise take several lines and push
+   the items off the screen. */
 function buildCatNav(){
   const nav = document.getElementById('catNav');
-  nav.innerHTML = '';
+  if(!nav) return;
+  let html = `<div class="cat-chip${activeCat === 'ALL' ? ' active' : ''}" onclick="setCat('ALL')">All</div>`;
+  CATEGORIES.forEach((cat, ci) => {
+    const n = getCategoryName(ci);
+    html += `<div class="cat-chip${activeCat === String(ci) ? ' active' : ''}" onclick="setCat('${ci}')" title="${n.en}">${n.ta || n.en}</div>`;
+  });
+  nav.innerHTML = html;
+}
+
+function setCat(ci){
+  activeCat = ci;
+  buildCatNav();
+  render();
+  // bring the chosen chip into view so the selection is always visible
+  const el = document.querySelector('#catNav .cat-chip.active');
+  if(el && el.scrollIntoView) el.scrollIntoView({ inline:'center', block:'nearest', behavior:'smooth' });
 }
 
 function changeQty(ci, ii, delta){
@@ -2038,6 +2081,7 @@ async function clearCart(){
   cart = {}; 
   activeCat = 'ALL';
   saveCart(); 
+  buildCatNav();   // keep the chip highlight in step with the reset filter
   render();
 }
 function computeTotals(cartObj){
