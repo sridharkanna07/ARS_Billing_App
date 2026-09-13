@@ -1221,7 +1221,8 @@ var SHEET_BACKUP_SCRIPT = [
 '    var ss = SpreadsheetApp.getActiveSpreadsheet();',
 '    var sh = ss.getSheetByName("Sales");',
 '    var head = ["Bill ID","Bill No","Date","Seller","Status","Items",',
-'                "Subtotal","Discount %","Discount","Total","Paid","Payment","Phone","Item Details"];',
+'                "Subtotal","Discount %","Discount","Total","Paid","Payment","Phone",',
+'                "Item Details","ItemsJSON"];',
 '    if (!sh) { sh = ss.insertSheet("Sales"); sh.appendRow(head); }',
 '    var items = b.items || [];',
 '    var detail = items.map(function(i){',
@@ -1230,7 +1231,8 @@ var SHEET_BACKUP_SCRIPT = [
 '    var qty = items.reduce(function(a,i){ return a + (i.qty || 0); }, 0);',
 '    var row = [b.id, b.billNo, b.time, b.sellerName, b.status, qty,',
 '               b.subtotal, b.discountPercent, b.discount, b.total,',
-'               b.paidAmount, b.paymentMethod, b.buyerPhone, detail];',
+'               b.paidAmount, b.paymentMethod, b.buyerPhone, detail,',
+'               JSON.stringify(items)];',
 '    var data = sh.getDataRange().getValues();',
 '    var at = -1;',
 '    for (var i = 1; i < data.length; i++) {',
@@ -1290,6 +1292,81 @@ async function retryPendingSheetBackups(){
   }
   var el = document.getElementById('sheetBackupStatus');
   if(el) el.textContent = backupStatusText();
+}
+
+/* Reads the Sales tab back down so every device — the admin's especially —
+   ends up holding every seller's bills. This is what makes the Google Sheet
+   the master record: each phone uploads its own bills, and on the next sync
+   each phone pulls down everyone else's.
+
+   Matched by Bill ID, so a bill already held locally is never duplicated; if
+   its status changed elsewhere (cancelled on another device) that is applied.
+   Bills that arrive this way are marked as already backed up, so they are not
+   pushed straight back up again. */
+function applySalesFromSheet(table){
+  if(!table || !table.cols || !table.rows) return;
+  var labels = table.cols.map(function(col){ return String((col && col.label) || '').trim(); });
+  var idx = {};
+  ['Bill ID','Bill No','Date','Seller','Status','Subtotal','Discount %','Discount',
+   'Total','Paid','Payment','Phone','ItemsJSON'].forEach(function(name){
+    idx[name] = labels.indexOf(name);
+  });
+  if(idx['Bill ID'] === -1) return;            // not the expected sheet
+
+  function val(row, name){
+    var i = idx[name];
+    if(i === -1 || !row.c[i]) return null;
+    return row.c[i].v != null ? row.c[i].v : null;
+  }
+
+  var list = loadJSON('ars_sales', []) || [];
+  var byId = {};
+  list.forEach(function(s){ byId[s.id] = s; });
+  var changed = false;
+
+  table.rows.forEach(function(row){
+    if(!row || !row.c) return;
+    var id = val(row, 'Bill ID');
+    if(!id) return;
+    id = String(id);
+    var status = String(val(row, 'Status') || 'confirmed');
+
+    var existing = byId[id];
+    if(existing){
+      if(existing.status !== status){ existing.status = status; changed = true; }
+      return;
+    }
+
+    var items = [];
+    try{ items = JSON.parse(val(row, 'ItemsJSON') || '[]'); }catch(e){ items = []; }
+
+    list.push({
+      id: id,
+      billNo: val(row, 'Bill No'),
+      time: val(row, 'Date'),
+      sellerName: val(row, 'Seller') || '',
+      status: status,
+      items: items,
+      subtotal: Number(val(row, 'Subtotal')) || 0,
+      discountPercent: Number(val(row, 'Discount %')) || 0,
+      discount: Number(val(row, 'Discount')) || 0,
+      total: Number(val(row, 'Total')) || 0,
+      paidAmount: val(row, 'Paid'),
+      paymentMethod: val(row, 'Payment') || 'cash',
+      buyerPhone: val(row, 'Phone') || '',
+      _sheetSynced: true          // came from the sheet; don't re-upload it
+    });
+    changed = true;
+  });
+
+  if(changed){
+    saveJSON('ars_sales', list);
+    SALES = list;
+    var adminOpen = !document.getElementById('adminScreen').classList.contains('hidden');
+    if(adminOpen) renderAdmin();
+    else if(activeTab === 'history') render();
+    refreshNotifBadges();
+  }
 }
 
 function backupStatusText(){
@@ -1594,12 +1671,18 @@ async function syncFromGoogleDrive(manual){
   const badge = document.getElementById('syncBadge');
   if(badge) badge.classList.add('syncing');
   try{
-    // Required tab: prices. Try the named tab "Price List" first (matches the
-    // template), falling back to whatever tab the link's gid points to, for
-    // sheets that were renamed or built by hand.
-    let priceTable = await fetchOptionalTab(parsed.id, 'Price List');
-    if(!priceTable) priceTable = await fetchGvizTable(parsed.id, { gid: parsed.gid });
-    applyGvizTable(priceTable);
+    // Prices: try the named "Price List" tab first (matches the template),
+    // otherwise whatever tab the link's gid points to, for sheets that were
+    // renamed or built by hand.
+    // Deliberately non-fatal: if the price tab is missing or unreadable, the
+    // sale history below must still upload and download. Letting a price
+    // problem abort the whole sync would silently stop the admin ever
+    // receiving the sellers' bills.
+    try{
+      let priceTable = await fetchOptionalTab(parsed.id, 'Price List');
+      if(!priceTable) priceTable = await fetchGvizTable(parsed.id, { gid: parsed.gid });
+      if(priceTable) applyGvizTable(priceTable);
+    }catch(e){ /* prices unavailable this time; carry on with the rest */ }
 
     // Optional extra tabs — silently skipped if not present in the sheet.
     const upiTable = await fetchOptionalTab(parsed.id, 'UPI');
@@ -1610,6 +1693,10 @@ async function syncFromGoogleDrive(manual){
 
     // Upload any bills that couldn't be backed up earlier (made offline, etc.)
     await retryPendingSheetBackups();
+
+    // ...then pull down every other device's bills, so the admin sees them all.
+    const salesTable = await fetchOptionalTab(parsed.id, 'Sales');
+    if(salesTable) applySalesFromSheet(salesTable);
 
     DRIVE_SYNC.lastSync = Date.now();
     DRIVE_SYNC.lastStatus = 'ok';
@@ -5390,7 +5477,7 @@ async function addToHomeScreen(){
              'Tap <b>Add</b> in the top corner'];
   } else if(location.protocol !== 'https:' && location.hostname !== 'localhost'){
     steps = ['You opened the copy saved in <b>Downloads</b>, and a saved file can never be added to the home screen.',
-             'Open this address in your browser instead:<br><b style="word-break:break-all;">sridharkanna07.github.io/ARS-Seller-Billing-App/</b>',
+             'Open this address in your browser instead:<br><b style="word-break:break-all;">sridharkanna07.github.io/ARS_Billing_App/</b>',
              'Then tap <b>Add</b> on the banner again.'];
   } else {
     steps = ['Open the browser menu <b>( &#8942; )</b> at the top right',
