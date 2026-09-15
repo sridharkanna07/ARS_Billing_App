@@ -974,6 +974,41 @@
 
 
 <!-- Price List Preview Modal with Pinch-Zoom -->
+<!-- ============ PUBLIC PRICE LIST (what a customer sees after scanning) ============ -->
+<div id="publicPriceScreen" style="display:none; position:fixed; inset:0; z-index:30000; background:var(--paper); overflow-y:auto;">
+  <div style="background:var(--maroon); color:#fff8e6; padding:calc(12px + env(safe-area-inset-top)) 14px 12px; text-align:center;">
+    <div style="font-size:20px; font-weight:800;" id="ppShopTa"></div>
+    <div style="font-size:11px; color:var(--gold); letter-spacing:1px;" id="ppShopEn"></div>
+    <div style="font-size:11px; margin-top:4px;" id="ppUpdated">Loading latest prices…</div>
+  </div>
+  <div id="publicPriceBody" style="padding:10px;"></div>
+  <div style="position:sticky; bottom:0; background:#fff; border-top:1px solid var(--line); padding:10px; display:flex; gap:8px;">
+    <button onclick="publicDownloadPdf(this)" style="flex:1; padding:12px; background:var(--maroon); color:#fff8e6; border:none; border-radius:8px; font-weight:800; cursor:pointer;">&#11015; Save as PDF</button>
+    <button onclick="publicSharePrices(this)" style="flex:1; padding:12px; background:#1e7a3c; color:#fff; border:none; border-radius:8px; font-weight:800; cursor:pointer;">&#128228; Share</button>
+  </div>
+</div>
+
+<!-- ============ QR for customers to scan ============ -->
+<div class="modal-overlay" id="priceQrOverlay" style="z-index:9999;">
+  <div class="bill-sheet" style="max-width:360px; padding:0;">
+    <div class="bill-head" style="display:flex; align-items:center; justify-content:space-between;">
+      <div class="bn">Customer Price List QR</div>
+      <button onclick="closePriceQr()" style="background:none; border:none; font-size:22px; cursor:pointer; color:var(--maroon); padding:4px 10px;">&times;</button>
+    </div>
+    <div style="padding:16px; text-align:center;">
+      <div id="priceQrBox" style="display:flex; align-items:center; justify-content:center; min-height:200px;"></div>
+      <div style="font-size:12px; color:#6b4b2a; margin-top:12px; line-height:1.5;">
+        Customers scan this to see your <b>current</b> price list on their own phone.<br>
+        It always shows the latest prices from your Google Sheet — print it once and leave it on the counter.
+      </div>
+      <div id="priceQrUrl" style="font-size:10px; color:#8a6a44; margin-top:8px; word-break:break-all;"></div>
+    </div>
+    <div class="bill-actions" style="padding:10px;">
+      <button onclick="printPriceQr()" style="flex:1; padding:12px; background:#3a3a3a; color:#fff; border:none; border-radius:8px; font-weight:800; cursor:pointer;">&#128424; Print QR</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="priceListPreviewOverlay" style="z-index:9999;">
   <div class="bill-sheet" style="max-width:500px; padding:0;">
     <div class="bill-head" style="display:flex; align-items:center; justify-content:space-between; position:sticky; top:0; z-index:10; background:#fff8ea;">
@@ -1700,10 +1735,11 @@ async function syncFromGoogleDrive(manual){
     // sale history below must still upload and download. Letting a price
     // problem abort the whole sync would silently stop the admin ever
     // receiving the sellers' bills.
+    DRIVE_SYNC.pricesOk = false;
     try{
       let priceTable = await fetchOptionalTab(parsed.id, 'Price List');
       if(!priceTable) priceTable = await fetchGvizTable(parsed.id, { gid: parsed.gid });
-      if(priceTable) applyGvizTable(priceTable);
+      if(priceTable){ applyGvizTable(priceTable); DRIVE_SYNC.pricesOk = true; }
     }catch(e){ /* prices unavailable this time; carry on with the rest */ }
 
     // Optional extra tabs — silently skipped if not present in the sheet.
@@ -2496,6 +2532,106 @@ function closeBill(){
   if(vp) vp.setAttribute('content', 'width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover');
 }
 
+/* ================= CUSTOMER-FACING PRICE LIST =================
+   The QR encodes this same page's address with "#price" on the end. Opening
+   that link skips the login entirely and shows a read-only price list, so a
+   customer scanning it sees the shop's current prices on their own phone.
+
+   Nothing is exposed but prices: the customer's phone has no bills, no
+   accounts and no admin panel — the prices are pulled fresh from the shared
+   Google Sheet, which is why the printed QR never needs reprinting when a
+   price changes. */
+
+function isPublicPriceRequest(){
+  return /^#?(price|pricelist)$/i.test(location.hash || '');
+}
+
+async function showPublicPriceList(){
+  var screen = document.getElementById('publicPriceScreen');
+  document.getElementById('loginScreen').classList.add('hidden');
+  document.getElementById('app').classList.add('hidden');
+  screen.style.display = 'block';
+
+  document.getElementById('ppShopTa').textContent = SHOP.name_ta;
+  document.getElementById('ppShopEn').textContent = SHOP.name_en;
+
+  function paint(){
+    document.getElementById('publicPriceBody').innerHTML = buildPriceListTableHTML();
+  }
+  paint();   // show stored prices immediately, then refresh
+
+  try{ await syncFromGoogleDrive(false); }catch(e){}
+  paint();
+
+  // Only claim the prices are current if the PRICE fetch itself succeeded.
+  // The overall sync can report success while prices quietly failed, and
+  // telling a customer "updated today" when it never reached the sheet
+  // would be misleading.
+  document.getElementById('ppUpdated').textContent = DRIVE_SYNC.pricesOk
+    ? 'Updated ' + new Date().toLocaleDateString('en-IN', {day:'numeric', month:'short', year:'numeric'})
+    : 'Showing last saved prices — please confirm at the counter';
+}
+
+async function publicDownloadPdf(btn){
+  var old = btn.textContent;
+  btn.textContent = 'Preparing…'; btn.disabled = true;
+  try{ await sharePriceListPDF(btn); }
+  catch(e){ alert('Could not create the PDF. ' + (e && e.message ? e.message : '')); }
+  finally{ btn.textContent = old; btn.disabled = false; }
+}
+
+async function publicSharePrices(btn){
+  var url = location.origin + location.pathname + '#price';
+  var text = SHOP.name_en + ' — price list: ' + url;
+  if(navigator.share){
+    try{ await navigator.share({ title: SHOP.name_en, text: text, url: url }); return; }
+    catch(e){ if(e && e.name === 'AbortError') return; }
+  }
+  try{ await navigator.clipboard.writeText(url); showAdminNotification('\u2713 Link copied'); }
+  catch(e){ alert(url); }
+}
+
+/* Shows the QR the shop prints and leaves on the counter. */
+async function openPriceQr(){
+  var overlay = document.getElementById('priceQrOverlay');
+  var box = document.getElementById('priceQrBox');
+  var url = location.origin + location.pathname + '#price';
+
+  overlay.classList.add('show');
+  box.innerHTML = '<div style="color:#8a6a44; font-size:13px;">Generating…</div>';
+  document.getElementById('priceQrUrl').textContent = url;
+
+  if(location.protocol !== 'https:' && location.hostname !== 'localhost'){
+    box.innerHTML = '<div style="color:var(--danger); font-size:13px; line-height:1.5;">Open the app from its web address first.<br>A QR made from a downloaded copy would not open on anyone else\'s phone.</div>';
+    return;
+  }
+
+  try{
+    await ensureQRCodeLib();
+    box.innerHTML = '';
+    new window.QRCode(box, { text: url, width: 220, height: 220, colorDark: '#2a1408', colorLight: '#ffffff' });
+  }catch(e){
+    box.innerHTML = '<div style="color:var(--danger); font-size:13px;">' + (e && e.message ? e.message : 'Could not create the QR.') + '</div>';
+  }
+}
+function closePriceQr(){ document.getElementById('priceQrOverlay').classList.remove('show'); }
+
+function printPriceQr(){
+  var qr = document.getElementById('priceQrBox').innerHTML;
+  if(!qr || qr.indexOf('Generating') !== -1) return;
+  var area = document.getElementById('printArea');
+  area.innerHTML = '<div class="br-page" style="text-align:center; padding:14px;">' +
+    '<div style="font-size:15px; font-weight:800;">' + SHOP.name_ta + '</div>' +
+    '<div style="font-size:10px; margin-bottom:8px;">' + SHOP.name_en + '</div>' +
+    '<div style="font-weight:800; font-size:12px; margin-bottom:6px;">SCAN FOR PRICE LIST</div>' +
+    qr +
+    '<div style="font-size:9px; margin-top:8px;">Scan to see today\'s prices</div></div>';
+  var cleanup = function(){ area.innerHTML = ''; window.removeEventListener('afterprint', cleanup); };
+  window.addEventListener('afterprint', cleanup);
+  window.print();
+  setTimeout(cleanup, 3000);
+}
+
 async function openPriceListPDFPreview(){
   const overlay = document.getElementById('priceListPreviewOverlay');
   const body = document.getElementById('priceListPreviewBody');
@@ -2739,6 +2875,7 @@ function renderHistoryList(){
   html += `<div style="margin:10px 0; padding:10px; background:#f5ede2; border-radius:8px; border-left:4px solid #7a1414;">
     <div style="font-size:12px; font-weight:700; color:#7a1414; margin-bottom:6px;">📄 Price List</div>
     <button onclick="openPriceListPDFPreview()" style="width:100%; padding:8px 12px; background:#7a1414; color:#fff8e6; border:none; border-radius:6px; font-weight:700; cursor:pointer; font-size:12px;">🔍 Preview (Pinch to Zoom) & Share</button>
+    <button onclick="openPriceQr()" style="width:100%; margin-top:6px; padding:8px 12px; background:#1e7a3c; color:#fff; border:none; border-radius:6px; font-weight:700; cursor:pointer; font-size:12px;">&#128290; Customer QR — scan to see prices</button>
   </div>`;
   
   if(list.length === 0){
@@ -5432,7 +5569,10 @@ window.addEventListener('storage', (e) => {
 });
 
 /* ---------------- INIT ---------------- */
-if(session && USERS[session.id]){
+if(isPublicPriceRequest()){
+  // Opened from a scanned QR: show only the price list, never the login.
+  showPublicPriceList();
+} else if(session && USERS[session.id]){
   enterApp();
 } else {
   session = null; saveJSON('ars_session', null);
